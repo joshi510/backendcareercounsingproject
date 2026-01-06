@@ -144,7 +144,9 @@ router.post('/login', async (req, res) => {
         id: user.id,
         email: user.email,
         full_name: user.full_name,
-        role: user.role
+        role: user.role,
+        center: user.center || null,
+        is_first_login: user.is_first_login || false
       }
     });
   } catch (error) {

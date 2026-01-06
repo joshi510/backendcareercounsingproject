@@ -31,6 +31,16 @@ const User = sequelize.define('User', {
     allowNull: false,
     defaultValue: 'STUDENT'
   },
+  is_first_login: {
+    type: DataTypes.BOOLEAN,
+    allowNull: false,
+    defaultValue: false
+  },
+  center: {
+    type: DataTypes.ENUM('CG', 'SG', 'Maninagar', 'Surat', 'Rajkot'),
+    allowNull: true,
+    comment: 'Center location for counselors'
+  },
   created_at: {
     type: DataTypes.DATE,
     allowNull: false,

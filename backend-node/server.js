@@ -3,6 +3,7 @@ const cors = require('cors');
 const config = require('./config');
 const { sequelize, testConnection } = require('./database');
 const { User, UserRole, Section, Question, QuestionType, Student } = require('./models');
+const { getPasswordHash } = require('./middleware/password');
 
 // Import routes
 const authRoutes = require('./routes/auth');
@@ -10,6 +11,12 @@ const testRoutes = require('./routes/test');
 const studentResultRoutes = require('./routes/studentResult');
 const counsellorNotesRoutes = require('./routes/counsellorNotes');
 const adminAnalyticsRoutes = require('./routes/adminAnalytics');
+const adminStudentsRoutes = require('./routes/adminStudents');
+const adminQuestionsRoutes = require('./routes/adminQuestions');
+const adminCounsellorsRoutes = require('./routes/adminCounsellors');
+const adminUsersRoutes = require('./routes/adminUsers');
+const counsellorStudentsRoutes = require('./routes/counsellorStudents');
+const changePasswordRoutes = require('./routes/changePassword');
 const testAccessRoutes = require('./routes/testAccess');
 
 const app = express();
@@ -41,10 +48,16 @@ app.use((req, res, next) => {
 
 // Routes
 app.use('/auth', authRoutes);
+app.use('/auth/change-password', changePasswordRoutes);
 app.use('/test', testRoutes);
 app.use('/student/result', studentResultRoutes);
 app.use('/counsellor/notes', counsellorNotesRoutes);
+app.use('/counsellor/students', counsellorStudentsRoutes);
 app.use('/admin/analytics', adminAnalyticsRoutes);
+app.use('/admin/students', adminStudentsRoutes);
+app.use('/admin/questions', adminQuestionsRoutes);
+app.use('/admin/counsellors', adminCounsellorsRoutes);
+app.use('/admin/users', adminUsersRoutes);
 app.use('/test', testAccessRoutes);
 
 // Root endpoint
@@ -116,6 +129,38 @@ async function initializeDatabase() {
         });
         console.log('✅ Added remaining_time_seconds column');
       }
+
+      // Add is_first_login column to users table if it doesn't exist
+      const usersTableDescription = await queryInterface.describeTable('users');
+      if (!usersTableDescription.is_first_login) {
+        console.log('🔵 Adding is_first_login column to users...');
+        await queryInterface.addColumn('users', 'is_first_login', {
+          type: require('sequelize').DataTypes.BOOLEAN,
+          allowNull: false,
+          defaultValue: false
+        });
+        console.log('✅ Added is_first_login column');
+      }
+
+      // Add center column to users table if it doesn't exist
+      if (!usersTableDescription.center) {
+        console.log('🔵 Adding center column to users...');
+        await queryInterface.addColumn('users', 'center', {
+          type: require('sequelize').DataTypes.ENUM('CG', 'SG', 'Maninagar', 'Surat', 'Rajkot'),
+          allowNull: true,
+          comment: 'Center location for counselors'
+        });
+        console.log('✅ Added center column');
+      }
+
+      // Create test_attempt_questions junction table if it doesn't exist
+      try {
+        const { TestAttemptQuestion } = require('./models');
+        await TestAttemptQuestion.sync({ alter: false });
+        console.log('✅ test_attempt_questions table verified/created');
+      } catch (tableError) {
+        console.warn('⚠️ test_attempt_questions table creation warning:', tableError.message);
+      }
     } catch (migrationError) {
       console.warn('⚠️ Migration warning (columns may already exist):', migrationError.message);
     }
@@ -130,14 +175,15 @@ async function initializeDatabase() {
     });
 
     if (!adminExists) {
-      // TEMP: Use plain text password for dev (should be hashed in production)
+      // Create admin user with properly hashed password
+      const hashedPassword = await getPasswordHash('admin123');
       await User.create({
         email: 'admin@test.com',
-        password_hash: 'admin123', // 🔥 TEMP FIX
+        password_hash: hashedPassword,
         full_name: 'Admin User',
         role: UserRole.ADMIN
       });
-      console.log('✅ Admin user created (TEMP password)');
+      console.log('✅ Admin user created with hashed password');
     } else {
       console.log('ℹ️ Admin already exists');
     }
@@ -224,12 +270,30 @@ async function initializeDatabase() {
     for (const section of allSections) {
       console.log(`🔵 Checking Section ${section.order_index} (${section.name}) for questions...`);
       
-      const sectionQuestionCount = await Question.count({
-        where: {
-          section_id: section.id,
-          is_active: true
+      // Count approved and active questions (defensive query in case status column doesn't exist)
+      let sectionQuestionCount = 0;
+      try {
+        sectionQuestionCount = await Question.count({
+          where: {
+            section_id: section.id,
+            status: 'approved',
+            is_active: true
+          }
+        });
+      } catch (error) {
+        // Fallback: if status column doesn't exist, count by is_active only
+        if (error.message && error.message.includes('status')) {
+          console.log(`⚠️  Status column not found, using is_active only for section ${section.id}`);
+          sectionQuestionCount = await Question.count({
+            where: {
+              section_id: section.id,
+              is_active: true
+            }
+          });
+        } else {
+          throw error;
         }
-      });
+      }
 
       if (sectionQuestionCount < 7) {
         const questionsToCreate = 7 - sectionQuestionCount;
@@ -302,6 +366,8 @@ async function initializeDatabase() {
             correct_answer: 'C', // Default neutral answer
             category: `section_${section.order_index}`,
             section_id: section.id,
+            status: 'approved',
+            source: 'manual',
             is_active: true,
             order_index: questionNum
           });
@@ -318,14 +384,14 @@ async function initializeDatabase() {
 
     if (section4) {
       const section4Questions = await Question.count({
-        where: { section_id: section4.id, is_active: true }
+        where: { section_id: section4.id, status: 'approved' }
       });
       console.log(`✅ Section 4: ${section4Questions}/7 questions`);
     }
 
     if (section5) {
       const section5Questions = await Question.count({
-        where: { section_id: section5.id, is_active: true }
+        where: { section_id: section5.id, status: 'approved' }
       });
       console.log(`✅ Section 5: ${section5Questions}/7 questions`);
     }
@@ -333,6 +399,35 @@ async function initializeDatabase() {
     const totalQuestions = await Question.count();
     console.log(`ℹ️ Total questions in database: ${totalQuestions}`);
 
+    // Migration: Update existing active questions to approved status
+    // This ensures backward compatibility with existing test attempts
+    const { Op } = require('sequelize');
+    const activeQuestions = await Question.findAll({
+      where: {
+        is_active: true,
+        [Op.or]: [
+          { status: null },
+          { status: { [Op.notIn]: ['pending', 'approved', 'rejected', 'inactive'] } }
+        ]
+      },
+      attributes: ['id']
+    });
+    
+    if (activeQuestions.length > 0) {
+      await Question.update(
+        { 
+          status: 'approved',
+          source: 'manual'
+        },
+        {
+          where: {
+            id: { [Op.in]: activeQuestions.map(q => q.id) }
+          }
+        }
+      );
+      console.log(`✅ Migrated ${activeQuestions.length} existing active questions to approved status`);
+    }
+    
   } catch (error) {
     console.error(`❌ Seed error: ${error.message}`);
     console.error(error.stack);

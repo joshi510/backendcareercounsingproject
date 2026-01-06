@@ -526,27 +526,44 @@ async function generateFallbackInterpretation(testAttemptId, totalQuestions, cor
 }
 
 async function generateAndSaveInterpretation(testAttemptId, totalQuestions, correctAnswers, percentage) {
-  const scores = await Score.findAll({ where: { test_attempt_id: testAttemptId } });
-  const sectionScores = {};
-  let categoryScores = null;
-  
-  if (scores && scores.length > 0) {
-    for (const score of scores) {
-      if (score.dimension.startsWith('section_')) {
-        sectionScores[score.dimension] = score.score_value;
+  try {
+    console.log(`🔵 Starting interpretation generation for attempt ${testAttemptId}`);
+    
+    const scores = await Score.findAll({ where: { test_attempt_id: testAttemptId } });
+    const sectionScores = {};
+    let categoryScores = null;
+    
+    if (scores && scores.length > 0) {
+      for (const score of scores) {
+        // Defensive check: ensure dimension exists and is a string
+        if (score && score.dimension && typeof score.dimension === 'string' && score.dimension.startsWith('section_')) {
+          sectionScores[score.dimension] = score.score_value;
+        }
+      }
+      categoryScores = {};
+      for (const score of scores) {
+        if (score && score.dimension) {
+          categoryScores[score.dimension] = score.score_value;
+        }
       }
     }
-    categoryScores = {};
-    for (const score of scores) {
-      categoryScores[score.dimension] = score.score_value;
+
+    console.log(`🔵 Section scores: ${JSON.stringify(sectionScores)}`);
+    console.log(`🔵 Calling Gemini interpretation API...`);
+
+    const { interpretation: interpretationData, error } = await generateGeminiInterpretation(
+      totalQuestions, correctAnswers, percentage, categoryScores
+    );
+
+    const isAiUsed = interpretationData !== null && error === null;
+    
+    if (error) {
+      console.log(`⚠️ Gemini interpretation error: ${error}`);
+    } else if (interpretationData) {
+      console.log(`✅ Gemini interpretation received successfully`);
+    } else {
+      console.log(`⚠️ No Gemini interpretation data, will use fallback`);
     }
-  }
-
-  const { interpretation: interpretationData, error } = await generateGeminiInterpretation(
-    totalQuestions, correctAnswers, percentage, categoryScores
-  );
-
-  const isAiUsed = interpretationData !== null && error === null;
 
   let finalInterpretationData;
   if (!interpretationData) {
@@ -581,9 +598,28 @@ async function generateAndSaveInterpretation(testAttemptId, totalQuestions, corr
     };
   }
 
-  let interpretedResult = await InterpretedResult.findOne({
-    where: { test_attempt_id: testAttemptId }
-  });
+    // Explicitly select only columns that exist in database to avoid "Unknown column" errors
+    console.log(`🔵 Checking for existing interpretation...`);
+    let interpretedResult = await InterpretedResult.findOne({
+      where: { test_attempt_id: testAttemptId },
+      attributes: [
+        'id',
+        'test_attempt_id',
+        'interpretation_text',
+        'strengths',
+        'areas_for_improvement',
+        'is_ai_generated',
+        'created_at',
+        'updated_at'
+        // Note: readiness_status, risk_level, etc. are NOT included (don't exist in DB)
+      ]
+    });
+    
+    if (interpretedResult) {
+      console.log(`🔵 Found existing interpretation (id: ${interpretedResult.id})`);
+    } else {
+      console.log(`🔵 No existing interpretation found, will create new one`);
+    }
 
   // Extract readiness and risk data from final interpretation
   const [readinessStatus, readinessExplanation] = calculateReadinessStatus(percentage);
@@ -605,51 +641,59 @@ async function generateAndSaveInterpretation(testAttemptId, totalQuestions, corr
   const { doNow, doLater } = generateDoNowDoLater(readinessStatus, roadmap);
   const riskExplanationHuman = generateHumanRiskExplanation(riskLevel, readinessStatus);
 
-  if (!interpretedResult) {
-    interpretedResult = await InterpretedResult.create({
-      test_attempt_id: testAttemptId,
-      interpretation_text: finalInterpretationData.summary || '',
-      strengths: JSON.stringify(finalInterpretationData.strengths || []),
-      areas_for_improvement: JSON.stringify(finalInterpretationData.weaknesses || []),
-      is_ai_generated: isAiUsed,
-      readiness_status: readinessStatus,
-      readiness_explanation: readinessExplanation,
-      risk_level: riskLevel,
-      risk_explanation: riskExplanation,
-      career_direction: careerDirection,
-      career_direction_reason: careerDirectionReason,
-      roadmap: JSON.stringify(roadmap),
-      counsellor_summary: counsellorSummary,
-      readiness_action_guidance: JSON.stringify(readinessActionGuidance),
-      career_confidence_level: careerConfidenceLevel,
-      career_confidence_explanation: careerConfidenceExplanation,
-      do_now_actions: JSON.stringify(doNow),
-      do_later_actions: JSON.stringify(doLater),
-      risk_explanation_human: riskExplanationHuman
-    });
-  } else {
-    interpretedResult.interpretation_text = finalInterpretationData.summary || interpretedResult.interpretation_text;
-    interpretedResult.strengths = JSON.stringify(finalInterpretationData.strengths || []);
-    interpretedResult.areas_for_improvement = JSON.stringify(finalInterpretationData.weaknesses || []);
-    interpretedResult.is_ai_generated = isAiUsed;
-    interpretedResult.readiness_status = readinessStatus;
-    interpretedResult.readiness_explanation = readinessExplanation;
-    interpretedResult.risk_level = riskLevel;
-    interpretedResult.risk_explanation = riskExplanation;
-    interpretedResult.career_direction = careerDirection;
-    interpretedResult.career_direction_reason = careerDirectionReason;
-    interpretedResult.roadmap = JSON.stringify(roadmap);
-    interpretedResult.counsellor_summary = counsellorSummary;
-    interpretedResult.readiness_action_guidance = JSON.stringify(readinessActionGuidance);
-    interpretedResult.career_confidence_level = careerConfidenceLevel;
-    interpretedResult.career_confidence_explanation = careerConfidenceExplanation;
-    interpretedResult.do_now_actions = JSON.stringify(doNow);
-    interpretedResult.do_later_actions = JSON.stringify(doLater);
-    interpretedResult.risk_explanation_human = riskExplanationHuman;
-    await interpretedResult.save();
-  }
+    // Only save columns that exist in the database table
+    // readiness_status, risk_level, etc. are calculated dynamically, not stored
+    console.log(`🔵 Saving interpretation to database...`);
+    if (!interpretedResult) {
+      console.log(`🔵 Creating new interpretation record...`);
+      interpretedResult = await InterpretedResult.create({
+        test_attempt_id: testAttemptId,
+        interpretation_text: finalInterpretationData.summary || '',
+        strengths: JSON.stringify(finalInterpretationData.strengths || []),
+        areas_for_improvement: JSON.stringify(finalInterpretationData.weaknesses || []),
+        is_ai_generated: isAiUsed
+        // Note: readiness_status, risk_level, career_direction, etc. are NOT stored in DB
+        // They are calculated dynamically when reading the interpretation
+      });
+      console.log(`✅ Created interpretation record (id: ${interpretedResult.id})`);
+    } else {
+      console.log(`🔵 Updating existing interpretation record (id: ${interpretedResult.id})...`);
+      // Only update columns that exist in database
+      await InterpretedResult.update({
+        interpretation_text: finalInterpretationData.summary || interpretedResult.interpretation_text,
+        strengths: JSON.stringify(finalInterpretationData.strengths || []),
+        areas_for_improvement: JSON.stringify(finalInterpretationData.weaknesses || []),
+        is_ai_generated: isAiUsed
+      }, {
+        where: { id: interpretedResult.id },
+        fields: ['interpretation_text', 'strengths', 'areas_for_improvement', 'is_ai_generated']
+      });
+      
+      // Refresh the instance to get updated values
+      interpretedResult = await InterpretedResult.findByPk(interpretedResult.id, {
+        attributes: [
+          'id',
+          'test_attempt_id',
+          'interpretation_text',
+          'strengths',
+          'areas_for_improvement',
+          'is_ai_generated',
+          'created_at',
+          'updated_at'
+        ]
+      });
+      console.log(`✅ Updated interpretation record`);
+    }
 
-  return { interpretedResult, interpretationData: finalInterpretationData };
+    console.log(`✅ Interpretation generation completed successfully for attempt ${testAttemptId}`);
+    return { interpretedResult, interpretationData: finalInterpretationData };
+  } catch (error) {
+    console.error(`❌ Error in generateAndSaveInterpretation for attempt ${testAttemptId}:`);
+    console.error(`❌ Error name: ${error.name}`);
+    console.error(`❌ Error message: ${error.message}`);
+    console.error(`❌ Error stack: ${error.stack}`);
+    throw error; // Re-throw to be caught by caller
+  }
 }
 
 module.exports = {

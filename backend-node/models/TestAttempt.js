@@ -54,6 +54,11 @@ const TestAttempt = sequelize.define('TestAttempt', {
     allowNull: true,
     defaultValue: 420 // 7 minutes = 420 seconds per section
   },
+  selected_question_ids: {
+    type: DataTypes.JSON,
+    allowNull: true,
+    comment: 'Array of question IDs randomly selected for this test attempt'
+  },
   created_at: {
     type: DataTypes.DATE,
     allowNull: false,
