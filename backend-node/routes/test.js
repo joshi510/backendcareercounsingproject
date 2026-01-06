@@ -1,10 +1,11 @@
 const express = require('express');
 const router = express.Router();
 const { Op } = require('sequelize');
+const { sequelize } = require('../database');
 const {
   User, UserRole, Question, TestAttempt, TestStatus,
   Answer, Score, InterpretedResult, Section, SectionProgress, SectionStatus,
-  Student
+  Student, TestAttemptQuestion
 } = require('../models');
 const { getCurrentUser, requireRole } = require('../middleware/auth');
 const { storeScores } = require('../services/scoring');
@@ -96,13 +97,76 @@ function parseOptionsToArray(optionsString) {
 // GET /test/questions
 router.get('/questions', getCurrentUser, requireStudent, async (req, res) => {
   try {
-    const questions = await Question.findAll({
-      where: { is_active: true },
-      order: [['order_index', 'ASC']]
+    const currentUser = req.user;
+    const attemptId = req.query.attempt_id ? parseInt(req.query.attempt_id, 10) : null;
+
+    // Find the test attempt
+    let testAttempt;
+    if (attemptId) {
+      testAttempt = await TestAttempt.findOne({
+        where: {
+          id: attemptId,
+          student_id: currentUser.id
+        }
+      });
+    } else {
+      testAttempt = await TestAttempt.findOne({
+        where: {
+          student_id: currentUser.id,
+          status: TestStatus.IN_PROGRESS
+        },
+        order: [['started_at', 'DESC']]
+      });
+    }
+
+    if (!testAttempt) {
+      return res.status(404).json({
+        detail: 'Test attempt not found. Please start a test first.'
+      });
+    }
+
+    // Get selected question IDs from junction table
+    // SQL Query: SELECT question_id FROM test_attempt_questions WHERE test_attempt_id = ?
+    const attemptQuestions = await TestAttemptQuestion.findAll({
+      where: {
+        test_attempt_id: testAttempt.id
+      },
+      attributes: ['question_id'],
+      order: [['question_id', 'ASC']]
     });
 
+    const selectedQuestionIds = attemptQuestions.map(tq => tq.question_id);
+    
+    if (!selectedQuestionIds || selectedQuestionIds.length === 0) {
+      return res.status(400).json({
+        error_code: 'NO_QUESTIONS_ASSIGNED',
+        message: 'No questions selected for this test attempt. Please start a section first.',
+        detail: `Test attempt ${testAttempt.id} has no questions assigned. Please access a section to generate questions.`
+      });
+    }
+
+    // Fetch only the selected questions
+    const questions = await Question.findAll({
+      where: { 
+        id: { [Op.in]: selectedQuestionIds },
+        is_active: true,
+        status: 'approved'
+      },
+      order: [['id', 'ASC']] // Order by ID to maintain consistent order
+    });
+
+    // Map questions to match selected order
+    const questionMap = {};
+    questions.forEach(q => {
+      questionMap[q.id] = q;
+    });
+
+    const orderedQuestions = selectedQuestionIds
+      .map(id => questionMap[id])
+      .filter(q => q !== undefined);
+
     return res.json(
-      questions.map(q => ({
+      orderedQuestions.map(q => ({
         question_id: q.id,
         question_text: q.question_text,
         options: parseOptionsToArray(q.options)
@@ -152,21 +216,55 @@ router.post('/start', getCurrentUser, requireStudent, async (req, res) => {
       }
     });
 
-    // If exists → return it (do NOT error)
+    // If exists → return it (questions are selected per section, not at test start)
     if (existingAttempt) {
-      const totalQuestions = await Question.count({ where: { is_active: true } });
+      // Count total questions assigned across all sections from junction table
+      const totalAssignedQuestions = await TestAttemptQuestion.count({
+        where: {
+          test_attempt_id: existingAttempt.id
+        }
+      });
+      
       return res.json({
         test_attempt_id: existingAttempt.id,
         status: existingAttempt.status,
         started_at: existingAttempt.started_at,
-        total_questions: totalQuestions
+        total_questions: totalAssignedQuestions || 0 // Questions are assigned per section
       });
     }
 
-    // Get total questions count
-    const totalQuestions = await Question.count({ where: { is_active: true } });
+    // Validate that at least one section has minimum 7 questions
+    // SQL Query: Check if any section has >= 7 questions
+    const sections = await Section.findAll({
+      where: { is_active: true },
+      order: [['order_index', 'ASC']]
+    });
 
-    // Create new test attempt
+    let hasEnoughQuestions = false;
+    for (const section of sections) {
+      const questionCount = await Question.count({
+        where: {
+          section_id: section.id,
+          status: 'approved',
+          is_active: true
+        }
+      });
+      
+      if (questionCount >= 7) {
+        hasEnoughQuestions = true;
+        break;
+      }
+    }
+
+    if (!hasEnoughQuestions) {
+      return res.status(400).json({
+        error_code: 'INSUFFICIENT_QUESTIONS',
+        message: 'Cannot start test. At least one section must have minimum 7 questions.',
+        detail: 'No section has at least 7 active and approved questions. Please add more questions to at least one section.'
+      });
+    }
+
+    // Create new test attempt (questions will be selected per section when accessing sections)
     const testAttempt = await TestAttempt.create({
       student_id: currentUser.id,
       status: TestStatus.IN_PROGRESS,
@@ -175,11 +273,13 @@ router.post('/start', getCurrentUser, requireStudent, async (req, res) => {
       remaining_time_seconds: 420
     });
 
+    console.log(`✅ Test attempt ${testAttempt.id} created (questions will be selected per section)`);
+
     return res.json({
       test_attempt_id: testAttempt.id,
       status: testAttempt.status,
       started_at: testAttempt.started_at,
-      total_questions: totalQuestions
+      total_questions: 0 // Questions are assigned per section, not at test start
     });
   } catch (error) {
     console.error(`❌ Error in start_test: ${error.message}`);
@@ -215,31 +315,52 @@ router.post('/submit', getCurrentUser, requireStudent, async (req, res) => {
       });
     }
 
-    // Get all active questions
-    const allQuestions = await Question.findAll({
-      where: { is_active: true },
-      order: [['order_index', 'ASC']]
+    // Get selected question IDs from junction table
+    // SQL Query: SELECT question_id FROM test_attempt_questions WHERE test_attempt_id = ?
+    const attemptQuestions = await TestAttemptQuestion.findAll({
+      where: {
+        test_attempt_id: attempt_id
+      },
+      attributes: ['question_id']
     });
 
-    const totalQuestions = allQuestions.length;
-
-    if (answers.length !== totalQuestions) {
+    const selectedQuestionIds = attemptQuestions.map(tq => tq.question_id);
+    
+    if (!selectedQuestionIds || selectedQuestionIds.length === 0) {
       return res.status(400).json({
-        detail: `Must answer all questions. Expected ${totalQuestions}, got ${answers.length}`
+        error_code: 'NO_QUESTIONS_ASSIGNED',
+        message: 'No questions selected for this test attempt. Please start sections to generate questions.',
+        detail: `Test attempt ${attempt_id} has no questions assigned. Please access sections to generate questions.`
       });
     }
 
-    // Validate all questions exist and are active
-    const questionIds = answers.map(a => a.question_id);
-    const questionMap = {};
-    for (const q of allQuestions) {
-      questionMap[q.id] = q;
+    const totalQuestions = selectedQuestionIds.length;
+
+    if (answers.length !== totalQuestions) {
+      return res.status(400).json({
+        error_code: 'INCOMPLETE_ANSWERS',
+        message: `Must answer all questions. Expected ${totalQuestions}, got ${answers.length}`,
+        detail: `Test attempt ${attempt_id} requires ${totalQuestions} answers, but ${answers.length} were provided.`
+      });
     }
 
+    // Validate all questions exist and are in the selected list
+    const questionIds = answers.map(a => a.question_id);
+    const selectedQuestionSet = new Set(selectedQuestionIds);
+    
+    // Check for duplicate answers
+    const answerQuestionIds = new Set();
     for (const qid of questionIds) {
-      if (!questionMap[qid]) {
+      if (answerQuestionIds.has(qid)) {
         return res.status(400).json({
-          detail: `Question ${qid} is invalid or not active`
+          detail: `Duplicate answer for question ${qid}`
+        });
+      }
+      answerQuestionIds.add(qid);
+      
+      if (!selectedQuestionSet.has(qid)) {
+        return res.status(400).json({
+          detail: `Question ${qid} is not part of this test attempt`
         });
       }
     }
@@ -388,20 +509,35 @@ router.post('/:test_attempt_id/complete', getCurrentUser, requireStudent, async 
       }
     }
 
-    // Calculate expected total questions from sections (5 sections × 7 questions = 35)
-    const expectedTotalQuestions = TOTAL_SECTIONS * QUESTIONS_PER_SECTION; // 5 * 7 = 35
+    // Get selected question IDs from junction table
+    // SQL Query: SELECT question_id FROM test_attempt_questions WHERE test_attempt_id = ?
+    const attemptQuestions = await TestAttemptQuestion.findAll({
+      where: {
+        test_attempt_id: testAttemptId
+      },
+      attributes: ['question_id']
+    });
+
+    const selectedQuestionIds = attemptQuestions.map(tq => tq.question_id);
+    
+    if (!selectedQuestionIds || selectedQuestionIds.length === 0) {
+      return res.status(400).json({
+        error_code: 'NO_QUESTIONS_ASSIGNED',
+        message: 'No questions selected for this test attempt. Please start sections to generate questions.',
+        detail: `Test attempt ${testAttemptId} has no questions assigned. Please access sections to generate questions.`
+      });
+    }
+
+    const expectedTotalQuestions = selectedQuestionIds.length;
 
     // Get answered questions count
     const answeredQuestions = await Answer.count({
       where: { test_attempt_id: testAttemptId }
     });
 
-    // Get actual database count for logging
-    const dbTotalQuestions = await Question.count({ where: { is_active: true } });
+    console.log(`🔵 Question check: ${answeredQuestions}/${expectedTotalQuestions} answered (auto_submit=${autoSubmit})`);
 
-    console.log(`🔵 Question check: ${answeredQuestions}/${expectedTotalQuestions} answered (DB has ${dbTotalQuestions} active questions, auto_submit=${autoSubmit})`);
-
-    // Validate that all expected questions are answered (35 questions)
+    // Validate that all expected questions are answered
     if (answeredQuestions < expectedTotalQuestions) {
       return res.status(400).json({
         detail: `Please answer all questions. ${answeredQuestions}/${expectedTotalQuestions} answered`
@@ -410,11 +546,6 @@ router.post('/:test_attempt_id/complete', getCurrentUser, requireStudent, async 
 
     if (answeredQuestions > expectedTotalQuestions) {
       console.log(`⚠️ Warning: More answers (${answeredQuestions}) than expected (${expectedTotalQuestions}), proceeding with validation`);
-    }
-
-    // Log if database count differs from expected (for debugging)
-    if (dbTotalQuestions !== expectedTotalQuestions) {
-      console.log(`⚠️ Info: Database has ${dbTotalQuestions} active questions, expected ${expectedTotalQuestions} (using expected for validation)`);
     }
 
     // Calculate and store scores (scores are calculated from all answers, regardless of sections)
@@ -436,8 +567,19 @@ router.post('/:test_attempt_id/complete', getCurrentUser, requireStudent, async 
 
     // Auto-create interpretation if it doesn't exist
     try {
+      // Explicitly select only columns that exist in database to avoid "Unknown column" errors
       let interpretedResult = await InterpretedResult.findOne({
-        where: { test_attempt_id: testAttemptId }
+        where: { test_attempt_id: testAttemptId },
+        attributes: [
+          'id',
+          'test_attempt_id',
+          'interpretation_text',
+          'strengths',
+          'areas_for_improvement',
+          'is_ai_generated',
+          'created_at',
+          'updated_at'
+        ]
       });
 
       if (!interpretedResult) {
@@ -883,12 +1025,22 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
       });
     }
 
-    // Calculate expected total questions from sections (5 sections × 7 questions = 35)
-    const expectedTotalQuestions = TOTAL_SECTIONS * QUESTIONS_PER_SECTION; // 5 * 7 = 35
-
     // Check if interpretation already exists
+    // Explicitly select only columns that exist in database to avoid "Unknown column" errors
     let interpretedResult = await InterpretedResult.findOne({
-      where: { test_attempt_id: testAttemptId }
+      where: { test_attempt_id: testAttemptId },
+      attributes: [
+        'id',
+        'test_attempt_id',
+        'interpretation_text',
+        'strengths',
+        'areas_for_improvement',
+        'is_ai_generated',
+        'created_at',
+        'updated_at'
+        // Note: readiness_status, risk_level, etc. are NOT included if they don't exist in DB
+        // They will be calculated dynamically if missing
+      ]
     });
 
     // Get score data
@@ -915,6 +1067,14 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
       }
 
       if (!score) {
+        // Get selected question IDs for default response from junction table
+        const defaultAttemptQuestions = await TestAttemptQuestion.findAll({
+          where: {
+            test_attempt_id: testAttemptId
+          },
+          attributes: ['question_id']
+        });
+        const defaultSelectedIds = defaultAttemptQuestions.map(tq => tq.question_id);
         // Return a default interpretation instead of 404
         console.log(`⚠️ Still no score found, returning default interpretation`);
         return res.json({
@@ -926,19 +1086,40 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
           readiness_status: 'PROCESSING',
           action_plan: ['Results are being calculated. Please refresh in a moment.'],
           overall_percentage: 0.0,
-          total_questions: expectedTotalQuestions,
+          total_questions: defaultSelectedIds.length || 7,
           correct_answers: 0,
           is_ai_generated: false
         });
       }
     }
 
+    // Get selected question IDs from junction table
+    // SQL Query: SELECT question_id FROM test_attempt_questions WHERE test_attempt_id = ?
+    const attemptQuestions = await TestAttemptQuestion.findAll({
+      where: {
+        test_attempt_id: testAttemptId
+      },
+      attributes: ['question_id']
+    });
+
+    const selectedQuestionIds = attemptQuestions.map(tq => tq.question_id);
+    
+    if (!selectedQuestionIds || selectedQuestionIds.length === 0) {
+      return res.status(400).json({
+        error_code: 'NO_QUESTIONS_ASSIGNED',
+        message: 'No questions selected for this test attempt. Please start sections to generate questions.',
+        detail: `Test attempt ${testAttemptId} has no questions assigned. Please access sections to generate questions.`
+      });
+    }
+
+    const expectedTotalQuestions = selectedQuestionIds.length;
+
     // Get answered questions count
     const answeredCount = await Answer.count({
       where: { test_attempt_id: testAttemptId }
     });
 
-    // Validate that all expected questions are answered (35 questions)
+    // Validate that all expected questions are answered
     if (answeredCount < expectedTotalQuestions) {
       return res.status(400).json({
         detail: `Cannot generate interpretation: ${answeredCount}/${expectedTotalQuestions} questions answered`
@@ -949,7 +1130,30 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
     // IMPORTANT: overall_percentage is calculated ONCE in scoring.js and stored in scores table
     // Do NOT recalculate here - always use score.score_value from database
     const totalQuestions = expectedTotalQuestions;
-    let percentage = score.score_value; // Retrieved from scores table - single source of truth
+    
+    // Defensive check: ensure score and score_value exist and are valid
+    if (!score || score.score_value == null) {
+      console.error(`❌ Invalid score data for attempt ${testAttemptId}: score=${score}, score_value=${score?.score_value}`);
+      return res.status(400).json({
+        error_code: 'INVALID_SCORE_DATA',
+        message: 'Score data is missing or invalid. Cannot generate interpretation.',
+        detail: `Test attempt ${testAttemptId} has invalid score data. Please ensure the test was properly completed and scored.`
+      });
+    }
+    
+    let percentage = typeof score.score_value === 'number' 
+      ? score.score_value 
+      : parseFloat(score.score_value);
+    
+    // Validate percentage is a valid number
+    if (isNaN(percentage)) {
+      console.error(`❌ Invalid percentage value for attempt ${testAttemptId}: ${score.score_value}`);
+      return res.status(400).json({
+        error_code: 'INVALID_PERCENTAGE',
+        message: 'Score percentage is invalid. Cannot generate interpretation.',
+        detail: `Test attempt ${testAttemptId} has invalid percentage value: ${score.score_value}`
+      });
+    }
 
     // Clamp percentage to valid range (0-100) if somehow invalid, but don't recalculate
     if (percentage < 0 || percentage > 100) {
@@ -963,11 +1167,26 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
     // Generate interpretation if not exists
     if (!interpretedResult) {
       try {
+        console.log(`🔵 Attempting to generate interpretation for test ${testAttemptId}...`);
         const result = await generateAndSaveInterpretation(testAttemptId, totalQuestions, correctAnswers, percentage);
         interpretedResult = result.interpretedResult;
-        console.log(`✅ Interpretation generated for test ${testAttemptId}`);
+        console.log(`✅ Interpretation generated successfully for test ${testAttemptId}`);
       } catch (error) {
-        console.log(`⚠️ Failed to generate interpretation: ${error.message}`);
+        console.error(`❌ Failed to generate interpretation for test ${testAttemptId}:`);
+        console.error(`❌ Error name: ${error.name}`);
+        console.error(`❌ Error message: ${error.message}`);
+        console.error(`❌ Error stack: ${error.stack}`);
+        
+        // Check if it's a database column error
+        if (error.name === 'SequelizeDatabaseError' && error.message.includes('Unknown column')) {
+          console.error(`❌ Database column mismatch detected. This indicates the model defines columns that don't exist in the database.`);
+          return res.status(400).json({
+            error_code: 'DATABASE_SCHEMA_MISMATCH',
+            message: 'Interpretation generation failed due to database schema mismatch.',
+            detail: `The database table is missing required columns. Please check the database schema. Error: ${error.message}`
+          });
+        }
+        
         // Return a processing message instead of 404
         const [readinessStatus, readinessExplanation] = calculateReadinessStatus(percentage);
         const [riskLevel, riskExplanation] = calculateRiskLevel(readinessStatus);
@@ -1058,17 +1277,37 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
       where: { test_attempt_id: testAttemptId }
     });
     for (const scoreItem of scoresQuery) {
+      // Defensive check: ensure dimension exists and is a string
+      if (!scoreItem || !scoreItem.dimension || typeof scoreItem.dimension !== 'string') {
+        console.warn(`⚠️ Invalid score item dimension for attempt ${testAttemptId}:`, scoreItem);
+        continue;
+      }
+      
       if (scoreItem.dimension.startsWith('section_')) {
-        sectionScoresDict[scoreItem.dimension] = scoreItem.score_value;
+        // Defensive check: ensure score_value is a valid number
+        const scoreValue = scoreItem.score_value != null 
+          ? (typeof scoreItem.score_value === 'number' ? scoreItem.score_value : parseFloat(scoreItem.score_value))
+          : 0;
+        
+        if (isNaN(scoreValue)) {
+          console.warn(`⚠️ Invalid score_value for dimension ${scoreItem.dimension} in attempt ${testAttemptId}`);
+          continue;
+        }
+        
+        sectionScoresDict[scoreItem.dimension] = scoreValue;
+        
         // Extract section number and create array for frontend
-        const sectionNum = parseInt(scoreItem.dimension.split('_')[1], 10);
-        if (!isNaN(sectionNum)) {
-          const sectionName = sections[sectionNum] || `Section ${sectionNum}`;
-          sectionScoresArray.push({
-            section_number: sectionNum,
-            section_name: sectionName,
-            score: Math.round(scoreItem.score_value * 100) / 100
-          });
+        const dimensionParts = scoreItem.dimension.split('_');
+        if (dimensionParts.length >= 2) {
+          const sectionNum = parseInt(dimensionParts[1], 10);
+          if (!isNaN(sectionNum) && sectionNum > 0) {
+            const sectionName = sections[sectionNum] || `Section ${sectionNum}`;
+            sectionScoresArray.push({
+              section_number: sectionNum,
+              section_name: sectionName,
+              score: Math.round(scoreValue * 100) / 100
+            });
+          }
         }
       }
     }
@@ -1078,32 +1317,132 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
     const [careerDirection, careerDirectionReason] = determineCareerDirection(sectionScoresDict, sections, percentage);
     const roadmap = generateActionRoadmap(readinessStatus, percentage);
 
-    const strengths = interpretedResult.strengths ? JSON.parse(interpretedResult.strengths) : [];
-    const weaknesses = interpretedResult.areas_for_improvement ? JSON.parse(interpretedResult.areas_for_improvement) : [];
+    // Safely parse JSON fields with defensive checks
+    // Handle case where interpretedResult might be null or missing fields
+    let strengths = [];
+    let weaknesses = [];
+    
+    if (interpretedResult) {
+      try {
+        if (interpretedResult.strengths) {
+          const parsed = typeof interpretedResult.strengths === 'string' 
+            ? JSON.parse(interpretedResult.strengths) 
+            : interpretedResult.strengths;
+          strengths = Array.isArray(parsed) ? parsed : [];
+        }
+      } catch (e) {
+        console.warn(`⚠️ Failed to parse strengths for attempt ${testAttemptId}: ${e.message}`);
+        strengths = [];
+      }
+
+      try {
+        if (interpretedResult.areas_for_improvement) {
+          const parsed = typeof interpretedResult.areas_for_improvement === 'string'
+            ? JSON.parse(interpretedResult.areas_for_improvement)
+            : interpretedResult.areas_for_improvement;
+          weaknesses = Array.isArray(parsed) ? parsed : [];
+        }
+      } catch (e) {
+        console.warn(`⚠️ Failed to parse areas_for_improvement for attempt ${testAttemptId}: ${e.message}`);
+        weaknesses = [];
+      }
+    }
     
     // Use stored values from database if available, otherwise calculate fresh
-    const storedReadinessStatus = interpretedResult.readiness_status || readinessStatus;
-    const storedReadinessExplanation = interpretedResult.readiness_explanation || readinessExplanation;
-    const storedRiskLevel = interpretedResult.risk_level || riskLevel;
-    const storedRiskExplanation = interpretedResult.risk_explanation || riskExplanation;
-    const storedCareerDirection = interpretedResult.career_direction || careerDirection;
-    const storedCareerDirectionReason = interpretedResult.career_direction_reason || careerDirectionReason;
-    const storedRoadmap = interpretedResult.roadmap ? JSON.parse(interpretedResult.roadmap) : roadmap;
+    // Safely access properties that may not exist in DB (defensive coding)
+    // Note: These columns (readiness_status, risk_level, etc.) are NOT in the attributes list
+    // because they don't exist in the database table, so they will always be undefined
+    // We always use the calculated values instead
+    const storedReadinessStatus = readinessStatus; // Always use calculated, DB column doesn't exist
+    const storedReadinessExplanation = readinessExplanation; // Always use calculated
+    const storedRiskLevel = riskLevel; // Always use calculated
+    const storedRiskExplanation = riskExplanation; // Always use calculated
+    const storedCareerDirection = careerDirection; // Always use calculated
+    const storedCareerDirectionReason = careerDirectionReason; // Always use calculated
     
-    // Parse new fields or generate fallbacks
-    const storedCounsellorSummary = interpretedResult.counsellor_summary || '';
-    const storedReadinessActionGuidance = interpretedResult.readiness_action_guidance 
-      ? JSON.parse(interpretedResult.readiness_action_guidance) 
-      : [];
-    const storedCareerConfidenceLevel = interpretedResult.career_confidence_level || 'MODERATE';
-    const storedCareerConfidenceExplanation = interpretedResult.career_confidence_explanation || '';
-    const storedDoNowActions = interpretedResult.do_now_actions 
-      ? JSON.parse(interpretedResult.do_now_actions) 
-      : [];
-    const storedDoLaterActions = interpretedResult.do_later_actions 
-      ? JSON.parse(interpretedResult.do_later_actions) 
-      : [];
-    const storedRiskExplanationHuman = interpretedResult.risk_explanation_human || storedRiskExplanation;
+    // Safely parse roadmap with defensive checks
+    // Handle case where interpretedResult might be null or missing fields
+    let storedRoadmap = roadmap;
+    if (interpretedResult) {
+      try {
+        if (interpretedResult.roadmap) {
+          const parsed = typeof interpretedResult.roadmap === 'string'
+            ? JSON.parse(interpretedResult.roadmap)
+            : interpretedResult.roadmap;
+          // Validate roadmap structure
+          if (parsed && typeof parsed === 'object' && parsed.phase1 && parsed.phase2 && parsed.phase3) {
+            storedRoadmap = parsed;
+          } else {
+            console.warn(`⚠️ Invalid roadmap structure for attempt ${testAttemptId}, using generated roadmap`);
+            storedRoadmap = roadmap;
+          }
+        }
+      } catch (e) {
+        console.warn(`⚠️ Failed to parse roadmap for attempt ${testAttemptId}: ${e.message}`);
+        storedRoadmap = roadmap;
+      }
+    }
+    
+    // Parse new fields or generate fallbacks with defensive checks
+    const storedCounsellorSummary = (interpretedResult && interpretedResult.counsellor_summary) 
+      ? interpretedResult.counsellor_summary 
+      : '';
+    
+    let storedReadinessActionGuidance = [];
+    if (interpretedResult) {
+      try {
+        if (interpretedResult.readiness_action_guidance) {
+          const parsed = typeof interpretedResult.readiness_action_guidance === 'string'
+            ? JSON.parse(interpretedResult.readiness_action_guidance)
+            : interpretedResult.readiness_action_guidance;
+          storedReadinessActionGuidance = Array.isArray(parsed) ? parsed : [];
+        }
+      } catch (e) {
+        console.warn(`⚠️ Failed to parse readiness_action_guidance for attempt ${testAttemptId}: ${e.message}`);
+        storedReadinessActionGuidance = [];
+      }
+    }
+    
+    const storedCareerConfidenceLevel = (interpretedResult && interpretedResult.career_confidence_level) 
+      ? interpretedResult.career_confidence_level 
+      : 'MODERATE';
+    const storedCareerConfidenceExplanation = (interpretedResult && interpretedResult.career_confidence_explanation) 
+      ? interpretedResult.career_confidence_explanation 
+      : '';
+    
+    let storedDoNowActions = [];
+    if (interpretedResult) {
+      try {
+        if (interpretedResult.do_now_actions) {
+          const parsed = typeof interpretedResult.do_now_actions === 'string'
+            ? JSON.parse(interpretedResult.do_now_actions)
+            : interpretedResult.do_now_actions;
+          storedDoNowActions = Array.isArray(parsed) ? parsed : [];
+        }
+      } catch (e) {
+        console.warn(`⚠️ Failed to parse do_now_actions for attempt ${testAttemptId}: ${e.message}`);
+        storedDoNowActions = [];
+      }
+    }
+    
+    let storedDoLaterActions = [];
+    if (interpretedResult) {
+      try {
+        if (interpretedResult.do_later_actions) {
+          const parsed = typeof interpretedResult.do_later_actions === 'string'
+            ? JSON.parse(interpretedResult.do_later_actions)
+            : interpretedResult.do_later_actions;
+          storedDoLaterActions = Array.isArray(parsed) ? parsed : [];
+        }
+      } catch (e) {
+        console.warn(`⚠️ Failed to parse do_later_actions for attempt ${testAttemptId}: ${e.message}`);
+        storedDoLaterActions = [];
+      }
+    }
+    
+    const storedRiskExplanationHuman = (interpretedResult && interpretedResult.risk_explanation_human) 
+      ? interpretedResult.risk_explanation_human 
+      : storedRiskExplanation;
 
     const interpretationData = {
       summary: interpretedResult.interpretation_text || generateCounsellorStyleSummary(
@@ -1114,11 +1453,34 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
       career_clusters: [storedCareerDirection],
       risk_level: storedRiskLevel,
       readiness_status: storedReadinessStatus,
-      action_plan: [
-        storedRoadmap.phase1.title + ': ' + storedRoadmap.phase1.actions.slice(0, 2).join(', '),
-        storedRoadmap.phase2.title + ': ' + storedRoadmap.phase2.actions.slice(0, 2).join(', '),
-        storedRoadmap.phase3.title + ': ' + storedRoadmap.phase3.actions.slice(0, 2).join(', ')
-      ],
+      action_plan: (() => {
+        // Defensive check: ensure roadmap has required structure
+        if (!storedRoadmap || typeof storedRoadmap !== 'object') {
+          return ['Action plan is being generated. Please refresh in a moment.'];
+        }
+        
+        const actionPlanItems = [];
+        try {
+          if (storedRoadmap.phase1 && storedRoadmap.phase1.title && Array.isArray(storedRoadmap.phase1.actions)) {
+            const phase1Actions = storedRoadmap.phase1.actions.slice(0, 2).filter(a => a).join(', ');
+            actionPlanItems.push(`${storedRoadmap.phase1.title}${phase1Actions ? ': ' + phase1Actions : ''}`);
+          }
+          if (storedRoadmap.phase2 && storedRoadmap.phase2.title && Array.isArray(storedRoadmap.phase2.actions)) {
+            const phase2Actions = storedRoadmap.phase2.actions.slice(0, 2).filter(a => a).join(', ');
+            actionPlanItems.push(`${storedRoadmap.phase2.title}${phase2Actions ? ': ' + phase2Actions : ''}`);
+          }
+          if (storedRoadmap.phase3 && storedRoadmap.phase3.title && Array.isArray(storedRoadmap.phase3.actions)) {
+            const phase3Actions = storedRoadmap.phase3.actions.slice(0, 2).filter(a => a).join(', ');
+            actionPlanItems.push(`${storedRoadmap.phase3.title}${phase3Actions ? ': ' + phase3Actions : ''}`);
+          }
+        } catch (e) {
+          console.warn(`⚠️ Error building action plan for attempt ${testAttemptId}: ${e.message}`);
+        }
+        
+        return actionPlanItems.length > 0 
+          ? actionPlanItems 
+          : ['Action plan is being generated. Please refresh in a moment.'];
+      })(),
       readiness_explanation: storedReadinessExplanation,
       risk_explanation: storedRiskExplanation,
       career_direction: storedCareerDirection,
@@ -1162,9 +1524,27 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
       risk_explanation_human: interpretationData.risk_explanation_human || interpretationData.risk_explanation || ''
     });
   } catch (error) {
-    console.error(`❌ Error in get_interpretation: ${error.message}`);
+    console.error(`❌ Error in get_interpretation: ${error.name}: ${error.message}`);
+    console.error(`❌ Error stack: ${error.stack}`);
+    
+    // Return 400 for validation/data errors, 500 only for unexpected errors
+    if (error.name === 'SequelizeValidationError' || 
+        error.name === 'SequelizeDatabaseError' ||
+        error.message.includes('JSON') ||
+        error.message.includes('parse') ||
+        error.message.includes('null') ||
+        error.message.includes('undefined')) {
+      return res.status(400).json({
+        error_code: 'INTERPRETATION_DATA_ERROR',
+        message: 'Invalid interpretation data. Cannot generate interpretation.',
+        detail: error.message || 'Data validation failed'
+      });
+    }
+    
     return res.status(500).json({
-      detail: 'Failed to get interpretation'
+      error_code: 'INTERNAL_ERROR',
+      message: 'An unexpected error occurred while generating interpretation.',
+      detail: error.message || 'Internal server error'
     });
   }
 });
@@ -1553,7 +1933,31 @@ router.get('/sections/:section_id/questions', getCurrentUser, requireStudent, as
     const attemptId = parseInt(req.query.attempt_id, 10);
     const currentUser = req.user;
 
-    // Verify test attempt belongs to user
+    // Log request details
+    console.log(`🔵 GET /test/sections/${sectionId}/questions - attempt_id=${attemptId}, user_id=${currentUser.id}`);
+
+    // Validate attempt_id parameter
+    if (!attemptId || isNaN(attemptId) || attemptId <= 0) {
+      console.log(`❌ Invalid attempt_id: ${req.query.attempt_id} (parsed as: ${attemptId})`);
+      return res.status(400).json({
+        error_code: 'ATTEMPT_INVALID',
+        message: 'Invalid attempt_id parameter. Please provide a valid test attempt ID.',
+        detail: `attempt_id must be a positive integer, got: ${req.query.attempt_id}`
+      });
+    }
+
+    // Validate section_id parameter
+    if (!sectionId || isNaN(sectionId) || sectionId <= 0) {
+      console.log(`❌ Invalid section_id: ${req.params.section_id} (parsed as: ${sectionId})`);
+      return res.status(400).json({
+        error_code: 'SECTION_INVALID',
+        message: 'Invalid section_id parameter. Please provide a valid section ID.',
+        detail: `section_id must be a positive integer, got: ${req.params.section_id}`
+      });
+    }
+
+    // SQL Query 1: Verify test attempt belongs to user
+    // SELECT * FROM test_attempts WHERE id = ? AND student_id = ?
     const testAttempt = await TestAttempt.findOne({
       where: {
         id: attemptId,
@@ -1562,25 +1966,48 @@ router.get('/sections/:section_id/questions', getCurrentUser, requireStudent, as
     });
 
     if (!testAttempt) {
+      console.log(`❌ Test attempt ${attemptId} not found for user ${currentUser.id}`);
       return res.status(404).json({
-        detail: 'Test attempt not found'
+        error_code: 'ATTEMPT_NOT_FOUND',
+        message: 'Test attempt not found or does not belong to you.',
+        detail: `No test attempt found with id=${attemptId} for user_id=${currentUser.id}`
       });
     }
 
-    // Verify section exists - try by ID first, then by order_index
+    console.log(`✅ Test attempt ${attemptId} found - status: ${testAttempt.status}, student_id: ${testAttempt.student_id}`);
+
+    // Check if attempt is in progress (allow IN_PROGRESS, block COMPLETED/ABANDONED)
+    if (testAttempt.status !== TestStatus.IN_PROGRESS) {
+      console.log(`❌ Test attempt ${attemptId} is not in progress - status: ${testAttempt.status}`);
+      return res.status(400).json({
+        error_code: 'ATTEMPT_NOT_IN_PROGRESS',
+        message: `Cannot fetch questions. Test attempt is ${testAttempt.status.toLowerCase()}.`,
+        detail: `Test attempt ${attemptId} has status: ${testAttempt.status}. Only IN_PROGRESS attempts can fetch questions.`
+      });
+    }
+
+    // SQL Query 2: Verify section exists - try by ID first, then by order_index
+    // SELECT * FROM sections WHERE id = ? OR (order_index = ? AND order_index BETWEEN 1 AND 5)
     let section = await Section.findByPk(sectionId);
     if (!section && sectionId >= 1 && sectionId <= 5) {
       section = await Section.findOne({ where: { order_index: sectionId } });
     }
 
     if (!section) {
+      console.log(`❌ Section ${sectionId} not found`);
       return res.status(404).json({
-        detail: `Section not found (ID: ${sectionId})`
+        error_code: 'SECTION_NOT_FOUND',
+        message: `Section not found.`,
+        detail: `No section found with id=${sectionId} or order_index=${sectionId}`
       });
     }
 
+    console.log(`✅ Section found - id: ${section.id}, order_index: ${section.order_index}, name: ${section.name}`);
+
     // Check if section is unlocked (previous sections must be completed)
     if (section.order_index > 1) {
+      // SQL Query 3: Get previous sections
+      // SELECT * FROM sections WHERE order_index < ? AND is_active = true ORDER BY order_index ASC
       const previousSections = await Section.findAll({
         where: {
           order_index: { [Op.lt]: section.order_index },
@@ -1589,6 +2016,8 @@ router.get('/sections/:section_id/questions', getCurrentUser, requireStudent, as
         order: [['order_index', 'ASC']]
       });
 
+      // SQL Query 4: Check if previous sections are completed
+      // SELECT * FROM section_progress WHERE test_attempt_id = ? AND section_id = ? AND status = 'COMPLETED'
       for (const prevSection of previousSections) {
         const prevProgress = await SectionProgress.findOne({
           where: {
@@ -1599,29 +2028,180 @@ router.get('/sections/:section_id/questions', getCurrentUser, requireStudent, as
         });
 
         if (!prevProgress) {
+          console.log(`❌ Previous section ${prevSection.order_index} (${prevSection.name}) not completed`);
           return res.status(403).json({
-            detail: `Please complete ${prevSection.name} first`
+            error_code: 'SECTION_LOCKED',
+            message: `Please complete ${prevSection.name} first.`,
+            detail: `Section ${section.order_index} (${section.name}) is locked. Previous section ${prevSection.order_index} (${prevSection.name}) must be completed first.`
           });
         }
       }
     }
 
-    // Get questions for this section
-    const questions = await Question.findAll({
+    // SQL Query 5: Check if questions already exist for this attempt + section
+    // SELECT question_id FROM test_attempt_questions WHERE test_attempt_id = ? 
+    // AND question_id IN (SELECT id FROM questions WHERE section_id = ? AND is_active = true AND status = 'approved')
+    const existingAttemptQuestions = await TestAttemptQuestion.findAll({
       where: {
-        section_id: section.id,
-        is_active: true
+        test_attempt_id: attemptId
       },
-      order: [['order_index', 'ASC']]
+      include: [{
+        model: Question,
+        as: 'question',
+        where: {
+          section_id: section.id,
+          is_active: true,
+          status: 'approved'
+        },
+        attributes: ['id']
+      }],
+      attributes: ['question_id']
     });
 
-    // CRITICAL: Validate exactly QUESTIONS_PER_SECTION questions per section
-    if (questions.length !== QUESTIONS_PER_SECTION) {
-      return res.status(500).json({
-        detail: `Section must have exactly ${QUESTIONS_PER_SECTION} questions. Found ${questions.length} questions.`
+    let selectedQuestionIds = existingAttemptQuestions.map(tq => tq.question_id);
+
+    // If questions not assigned yet for this section, generate them now (idempotent - safe to call multiple times)
+    if (!selectedQuestionIds || selectedQuestionIds.length === 0) {
+      console.log(`⚠️ Test attempt ${attemptId} has no questions assigned for section ${section.id}, generating now...`);
+      
+      // SQL Query 6: Count eligible questions for this section FIRST (for validation)
+      // SELECT COUNT(*) FROM questions WHERE section_id = ? AND status = 'approved' AND is_active = true
+      const eligibleQuestionCount = await Question.count({
+        where: { 
+          section_id: section.id,
+          status: 'approved',
+          is_active: true 
+        }
       });
+
+      console.log(`🔵 Found ${eligibleQuestionCount} eligible questions in section ${section.id} (${section.name})`);
+
+      // Validate minimum 7 questions required for this section
+      // NEVER throw error if questions > 7, ONLY if < 7
+      if (eligibleQuestionCount < 7) {
+        console.log(`❌ Insufficient questions in section ${section.id}: ${eligibleQuestionCount} < 7`);
+        return res.status(400).json({
+          error_code: 'INSUFFICIENT_QUESTIONS',
+          message: `Cannot start section. Minimum 7 questions required in ${section.name}.`,
+          detail: `Section ${section.id} (${section.name}) has only ${eligibleQuestionCount} active and approved questions. At least 7 are required.`
+        });
+      }
+
+      // Get previous attempt question IDs for this section to avoid repetition (if retake allowed)
+      let previousQuestionIds = [];
+      // SQL Query 7: Get previous completed attempt
+      // SELECT * FROM test_attempts WHERE student_id = ? AND status = 'COMPLETED' ORDER BY completed_at DESC LIMIT 1
+      const previousAttempt = await TestAttempt.findOne({
+        where: {
+          student_id: currentUser.id,
+          status: TestStatus.COMPLETED
+        },
+        order: [['completed_at', 'DESC']]
+      });
+
+      if (previousAttempt) {
+        // SQL Query 8: Get questions from previous attempt for this section
+        // SELECT question_id FROM test_attempt_questions WHERE test_attempt_id = ? 
+        // AND question_id IN (SELECT id FROM questions WHERE section_id = ?)
+        const previousAttemptQuestions = await TestAttemptQuestion.findAll({
+          where: {
+            test_attempt_id: previousAttempt.id
+          },
+          include: [{
+            model: Question,
+            as: 'question',
+            where: {
+              section_id: section.id
+            },
+            attributes: ['id']
+          }],
+          attributes: ['question_id']
+        });
+        
+        previousQuestionIds = previousAttemptQuestions.map(tq => tq.question_id);
+        console.log(`🔵 Previous attempt had ${previousQuestionIds.length} questions in section ${section.id}`);
+      }
+
+      // Build WHERE clause for candidate questions
+      let candidateWhereClause = {
+        section_id: section.id,
+        status: 'approved',
+        is_active: true
+      };
+
+      // If we have previous questions and enough total questions, exclude them
+      if (previousQuestionIds.length > 0 && eligibleQuestionCount > 7) {
+        candidateWhereClause.id = {
+          [Op.notIn]: previousQuestionIds
+        };
+      }
+
+      // SQL Query 9: Randomly select exactly 7 questions using SQL ORDER BY RAND()
+      // SELECT id FROM questions WHERE section_id = ? AND status = 'approved' AND is_active = true 
+      // [AND id NOT IN (...)] ORDER BY RAND() LIMIT 7
+      const candidateQuestions = await Question.findAll({
+        where: candidateWhereClause,
+        attributes: ['id'],
+        order: [[sequelize.literal('RAND()'), 'ASC']], // SQL RANDOM selection
+        limit: 7,
+        raw: true
+      });
+
+      // If we filtered out previous questions but don't have enough, fall back to all questions
+      if (candidateQuestions.length < 7 && previousQuestionIds.length > 0) {
+        console.log(`⚠️ Not enough unique questions (${candidateQuestions.length}), falling back to all available questions`);
+        const allQuestions = await Question.findAll({
+          where: {
+            section_id: section.id,
+            status: 'approved',
+            is_active: true
+          },
+          attributes: ['id'],
+          order: [[sequelize.literal('RAND()'), 'ASC']], // SQL RANDOM selection
+          limit: 7,
+          raw: true
+        });
+        selectedQuestionIds = allQuestions.map(q => q.id);
+      } else {
+        selectedQuestionIds = candidateQuestions.map(q => q.id);
+      }
+
+      console.log(`✅ Randomly selected ${selectedQuestionIds.length} questions using SQL RAND() for section ${section.id}: [${selectedQuestionIds.join(', ')}]`);
+
+      // SQL Query 9: Insert selected questions into junction table
+      // INSERT INTO test_attempt_questions (test_attempt_id, question_id, created_at) VALUES (?, ?, NOW())
+      const questionRecords = selectedQuestionIds.map(qid => ({
+        test_attempt_id: attemptId,
+        question_id: qid
+      }));
+
+      await TestAttemptQuestion.bulkCreate(questionRecords, {
+        ignoreDuplicates: true // Idempotent: if already exists, ignore
+      });
+
+      console.log(`✅ Generated and saved ${selectedQuestionIds.length} randomly selected questions for attempt ${attemptId}, section ${section.id}: [${selectedQuestionIds.join(', ')}]`);
+    } else {
+      console.log(`✅ Test attempt ${attemptId} already has ${selectedQuestionIds.length} questions assigned for section ${section.id}: [${selectedQuestionIds.join(', ')}]`);
     }
 
+    // SQL Query 10: Get questions for this section from the junction table
+    // SELECT q.* FROM questions q 
+    // INNER JOIN test_attempt_questions taq ON q.id = taq.question_id 
+    // WHERE taq.test_attempt_id = ? AND q.section_id = ? AND q.is_active = true AND q.status = 'approved'
+    // ORDER BY q.id ASC
+    const questions = await Question.findAll({
+      where: {
+        id: { [Op.in]: selectedQuestionIds },
+        section_id: section.id,
+        is_active: true,
+        status: 'approved'
+      },
+      order: [['id', 'ASC']]
+    });
+
+    console.log(`✅ Found ${questions.length} questions for section ${section.id} (${section.name}) from junction table`);
+
+    // Return questions (idempotent - same questions returned on refresh)
     return res.json(
       questions.map(q => ({
         question_id: q.id,
@@ -1630,9 +2210,12 @@ router.get('/sections/:section_id/questions', getCurrentUser, requireStudent, as
       }))
     );
   } catch (error) {
-    console.error(`❌ Error in get_section_questions: ${error.message}`);
+    console.error(`❌ Error in get_section_questions: ${error.name}: ${error.message}`);
+    console.error(`❌ Error stack: ${error.stack}`);
     return res.status(500).json({
-      detail: 'Failed to get section questions'
+      error_code: 'INTERNAL_ERROR',
+      message: 'An unexpected error occurred while fetching section questions.',
+      detail: error.message
     });
   }
 });
@@ -2074,21 +2657,46 @@ router.post('/sections/:section_id/submit', getCurrentUser, requireStudent, asyn
       });
     }
 
-    // Get section questions
-    const sectionQuestions = await Question.findAll({
+    // Get selected question IDs from junction table for this section only
+    // SQL Query: SELECT question_id FROM test_attempt_questions WHERE test_attempt_id = ? 
+    // AND question_id IN (SELECT id FROM questions WHERE section_id = ?)
+    const attemptQuestions = await TestAttemptQuestion.findAll({
       where: {
-        section_id: section.id,
-        is_active: true
+        test_attempt_id: attempt_id
       },
-      order: [['order_index', 'ASC']]
+      include: [{
+        model: Question,
+        as: 'question',
+        where: {
+          section_id: section.id,
+          is_active: true,
+          status: 'approved'
+        },
+        attributes: ['id']
+      }],
+      attributes: ['question_id']
     });
 
-    // CRITICAL: Validate exactly QUESTIONS_PER_SECTION questions per section
-    if (sectionQuestions.length !== QUESTIONS_PER_SECTION) {
-      return res.status(500).json({
-        detail: `Section must have exactly ${QUESTIONS_PER_SECTION} questions. Found ${sectionQuestions.length} questions.`
+    const selectedQuestionIds = attemptQuestions.map(tq => tq.question_id);
+    
+    if (!selectedQuestionIds || selectedQuestionIds.length === 0) {
+      return res.status(400).json({
+        error_code: 'NO_QUESTIONS_ASSIGNED',
+        message: `No questions assigned for section ${section.name}. Please access this section first to generate questions.`,
+        detail: `Test attempt ${attempt_id} has no questions assigned for section ${section.id} (${section.name}). Please access the section to generate questions.`
       });
     }
+
+    // Get section questions from junction table
+    const sectionQuestions = await Question.findAll({
+      where: {
+        id: { [Op.in]: selectedQuestionIds },
+        section_id: section.id,
+        is_active: true,
+        status: 'approved'
+      },
+      order: [['id', 'ASC']]
+    });
 
     if (answers.length !== sectionQuestions.length) {
       return res.status(400).json({

@@ -11,6 +11,8 @@ const { Career } = require('./Career');
 const { CounsellorNote } = require('./CounsellorNote');
 const { Section } = require('./Section');
 const { SectionProgress, SectionStatus } = require('./SectionProgress');
+const { QuestionApproval, ApprovalStatus } = require('./QuestionApproval');
+const TestAttemptQuestion = require('./TestAttemptQuestion');
 
 // Define associations
 User.hasOne(Student, { foreignKey: 'user_id', as: 'studentProfile' });
@@ -44,10 +46,22 @@ SectionProgress.belongsTo(Section, { foreignKey: 'section_id', as: 'section' });
 TestAttempt.hasMany(SectionProgress, { foreignKey: 'test_attempt_id', as: 'sectionProgresses' });
 SectionProgress.belongsTo(TestAttempt, { foreignKey: 'test_attempt_id', as: 'testAttempt' });
 
+// TestAttemptQuestion associations (many-to-many: TestAttempt <-> Question)
+TestAttempt.hasMany(TestAttemptQuestion, { foreignKey: 'test_attempt_id', as: 'attemptQuestions' });
+TestAttemptQuestion.belongsTo(TestAttempt, { foreignKey: 'test_attempt_id', as: 'testAttempt' });
+Question.hasMany(TestAttemptQuestion, { foreignKey: 'question_id', as: 'attemptQuestions' });
+TestAttemptQuestion.belongsTo(Question, { foreignKey: 'question_id', as: 'question' });
+
 User.hasMany(CounsellorNote, { foreignKey: 'counsellor_id', as: 'counsellorNotes' });
 CounsellorNote.belongsTo(User, { foreignKey: 'counsellor_id', as: 'counsellor' });
 CounsellorNote.belongsTo(User, { foreignKey: 'student_id', as: 'student' });
 CounsellorNote.belongsTo(TestAttempt, { foreignKey: 'test_attempt_id', as: 'testAttempt' });
+
+// Question Approval associations
+Question.hasMany(QuestionApproval, { foreignKey: 'question_id', as: 'approvals' });
+QuestionApproval.belongsTo(Question, { foreignKey: 'question_id', as: 'question' });
+QuestionApproval.belongsTo(User, { foreignKey: 'approved_by', as: 'approver' });
+User.hasMany(QuestionApproval, { foreignKey: 'approved_by', as: 'questionApprovals' });
 
 module.exports = {
   User,
@@ -65,6 +79,9 @@ module.exports = {
   CounsellorNote,
   Section,
   SectionProgress,
-  SectionStatus
+  SectionStatus,
+  QuestionApproval,
+  ApprovalStatus,
+  TestAttemptQuestion
 };
 
