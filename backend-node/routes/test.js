@@ -9,12 +9,12 @@ const {
 } = require('../models');
 const { getCurrentUser, requireRole } = require('../middleware/auth');
 const { storeScores } = require('../services/scoring');
-const { 
-  generateAndSaveInterpretation, 
-  calculateReadinessStatus, 
-  calculateRiskLevel, 
-  determineCareerDirection, 
-  generateActionRoadmap, 
+const {
+  generateAndSaveInterpretation,
+  calculateReadinessStatus,
+  calculateRiskLevel,
+  determineCareerDirection,
+  generateActionRoadmap,
   generateCounsellorStyleSummary,
   generateCounsellorSummary,
   generateReadinessActionGuidance,
@@ -136,7 +136,7 @@ router.get('/questions', getCurrentUser, requireStudent, async (req, res) => {
     });
 
     const selectedQuestionIds = attemptQuestions.map(tq => tq.question_id);
-    
+
     if (!selectedQuestionIds || selectedQuestionIds.length === 0) {
       return res.status(400).json({
         error_code: 'NO_QUESTIONS_ASSIGNED',
@@ -147,7 +147,7 @@ router.get('/questions', getCurrentUser, requireStudent, async (req, res) => {
 
     // Fetch only the selected questions
     const questions = await Question.findAll({
-      where: { 
+      where: {
         id: { [Op.in]: selectedQuestionIds },
         is_active: true,
         status: 'approved'
@@ -224,7 +224,7 @@ router.post('/start', getCurrentUser, requireStudent, async (req, res) => {
           test_attempt_id: existingAttempt.id
         }
       });
-      
+
       return res.json({
         test_attempt_id: existingAttempt.id,
         status: existingAttempt.status,
@@ -249,7 +249,7 @@ router.post('/start', getCurrentUser, requireStudent, async (req, res) => {
           is_active: true
         }
       });
-      
+
       if (questionCount >= 7) {
         hasEnoughQuestions = true;
         break;
@@ -325,7 +325,7 @@ router.post('/submit', getCurrentUser, requireStudent, async (req, res) => {
     });
 
     const selectedQuestionIds = attemptQuestions.map(tq => tq.question_id);
-    
+
     if (!selectedQuestionIds || selectedQuestionIds.length === 0) {
       return res.status(400).json({
         error_code: 'NO_QUESTIONS_ASSIGNED',
@@ -347,7 +347,7 @@ router.post('/submit', getCurrentUser, requireStudent, async (req, res) => {
     // Validate all questions exist and are in the selected list
     const questionIds = answers.map(a => a.question_id);
     const selectedQuestionSet = new Set(selectedQuestionIds);
-    
+
     // Check for duplicate answers
     const answerQuestionIds = new Set();
     for (const qid of questionIds) {
@@ -357,7 +357,7 @@ router.post('/submit', getCurrentUser, requireStudent, async (req, res) => {
         });
       }
       answerQuestionIds.add(qid);
-      
+
       if (!selectedQuestionSet.has(qid)) {
         return res.status(400).json({
           detail: `Question ${qid} is not part of this test attempt`
@@ -519,7 +519,7 @@ router.post('/:test_attempt_id/complete', getCurrentUser, requireStudent, async 
     });
 
     const selectedQuestionIds = attemptQuestions.map(tq => tq.question_id);
-    
+
     if (!selectedQuestionIds || selectedQuestionIds.length === 0) {
       return res.status(400).json({
         error_code: 'NO_QUESTIONS_ASSIGNED',
@@ -697,7 +697,7 @@ router.get('/:test_attempt_id/state', getCurrentUser, requireStudent, async (req
     // Get section progress for timer calculation
     let remainingTimeSeconds = testAttempt.remaining_time_seconds || 420;
     let isPaused = false;
-    
+
     if (currentSection) {
       const sectionProgress = await SectionProgress.findOne({
         where: {
@@ -708,7 +708,7 @@ router.get('/:test_attempt_id/state', getCurrentUser, requireStudent, async (req
 
       if (sectionProgress) {
         isPaused = !!sectionProgress.paused_at;
-        
+
         // Calculate remaining time from backend
         if (!isPaused && sectionProgress.section_start_time) {
           const now = new Date();
@@ -716,7 +716,7 @@ router.get('/:test_attempt_id/state', getCurrentUser, requireStudent, async (req
           const elapsedSeconds = Math.floor((now - startTime) / 1000) + sectionProgress.total_time_spent;
           const sectionTimeLimit = 420;
           remainingTimeSeconds = Math.max(0, sectionTimeLimit - elapsedSeconds);
-          
+
           // Update test attempt with calculated remaining time
           testAttempt.remaining_time_seconds = remainingTimeSeconds;
           await testAttempt.save();
@@ -793,11 +793,11 @@ router.get('/:test_attempt_id/progress', getCurrentUser, requireStudent, async (
     if (inProgressProgress) {
       currentSection = await Section.findByPk(inProgressProgress.section_id);
       currentSectionProgress = inProgressProgress;
-      
+
       // Use remaining_time_seconds from test_attempt if available (persisted on pause)
       // Otherwise calculate from section progress
       const sectionTimeLimit = 420; // 7 minutes = 420 seconds
-      
+
       // ALWAYS use remaining_time_seconds from test_attempt if available (persisted on pause/resume)
       // Otherwise calculate from section progress
       if (testAttempt.remaining_time_seconds !== null && testAttempt.remaining_time_seconds !== undefined) {
@@ -818,7 +818,7 @@ router.get('/:test_attempt_id/progress', getCurrentUser, requireStudent, async (
         }
 
         remainingTimeSeconds = Math.max(0, sectionTimeLimit - elapsedSeconds);
-        
+
         // Update test_attempt with calculated remaining time for persistence
         testAttempt.remaining_time_seconds = remainingTimeSeconds;
         await testAttempt.save();
@@ -1103,7 +1103,7 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
     });
 
     const selectedQuestionIds = attemptQuestions.map(tq => tq.question_id);
-    
+
     if (!selectedQuestionIds || selectedQuestionIds.length === 0) {
       return res.status(400).json({
         error_code: 'NO_QUESTIONS_ASSIGNED',
@@ -1130,7 +1130,7 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
     // IMPORTANT: overall_percentage is calculated ONCE in scoring.js and stored in scores table
     // Do NOT recalculate here - always use score.score_value from database
     const totalQuestions = expectedTotalQuestions;
-    
+
     // Defensive check: ensure score and score_value exist and are valid
     if (!score || score.score_value == null) {
       console.error(`❌ Invalid score data for attempt ${testAttemptId}: score=${score}, score_value=${score?.score_value}`);
@@ -1140,11 +1140,11 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
         detail: `Test attempt ${testAttemptId} has invalid score data. Please ensure the test was properly completed and scored.`
       });
     }
-    
-    let percentage = typeof score.score_value === 'number' 
-      ? score.score_value 
+
+    let percentage = typeof score.score_value === 'number'
+      ? score.score_value
       : parseFloat(score.score_value);
-    
+
     // Validate percentage is a valid number
     if (isNaN(percentage)) {
       console.error(`❌ Invalid percentage value for attempt ${testAttemptId}: ${score.score_value}`);
@@ -1176,7 +1176,7 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
         console.error(`❌ Error name: ${error.name}`);
         console.error(`❌ Error message: ${error.message}`);
         console.error(`❌ Error stack: ${error.stack}`);
-        
+
         // Check if it's a database column error
         if (error.name === 'SequelizeDatabaseError' && error.message.includes('Unknown column')) {
           console.error(`❌ Database column mismatch detected. This indicates the model defines columns that don't exist in the database.`);
@@ -1186,7 +1186,7 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
             detail: `The database table is missing required columns. Please check the database schema. Error: ${error.message}`
           });
         }
-        
+
         // Return a processing message instead of 404
         const [readinessStatus, readinessExplanation] = calculateReadinessStatus(percentage);
         const [riskLevel, riskExplanation] = calculateRiskLevel(readinessStatus);
@@ -1209,7 +1209,7 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
 
         const [careerDirection, careerDirectionReason] = determineCareerDirection(sectionScoresDict, sections, percentage);
         const roadmap = generateActionRoadmap(readinessStatus, percentage);
-        
+
         // Generate new fields for error response
         const counsellorSummary = generateCounsellorSummary(percentage, readinessStatus, careerDirection, sectionScoresDict);
         const readinessActionGuidance = generateReadinessActionGuidance(readinessStatus);
@@ -1282,20 +1282,20 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
         console.warn(`⚠️ Invalid score item dimension for attempt ${testAttemptId}:`, scoreItem);
         continue;
       }
-      
+
       if (scoreItem.dimension.startsWith('section_')) {
         // Defensive check: ensure score_value is a valid number
-        const scoreValue = scoreItem.score_value != null 
+        const scoreValue = scoreItem.score_value != null
           ? (typeof scoreItem.score_value === 'number' ? scoreItem.score_value : parseFloat(scoreItem.score_value))
           : 0;
-        
+
         if (isNaN(scoreValue)) {
           console.warn(`⚠️ Invalid score_value for dimension ${scoreItem.dimension} in attempt ${testAttemptId}`);
           continue;
         }
-        
+
         sectionScoresDict[scoreItem.dimension] = scoreValue;
-        
+
         // Extract section number and create array for frontend
         const dimensionParts = scoreItem.dimension.split('_');
         if (dimensionParts.length >= 2) {
@@ -1321,12 +1321,12 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
     // Handle case where interpretedResult might be null or missing fields
     let strengths = [];
     let weaknesses = [];
-    
+
     if (interpretedResult) {
       try {
         if (interpretedResult.strengths) {
-          const parsed = typeof interpretedResult.strengths === 'string' 
-            ? JSON.parse(interpretedResult.strengths) 
+          const parsed = typeof interpretedResult.strengths === 'string'
+            ? JSON.parse(interpretedResult.strengths)
             : interpretedResult.strengths;
           strengths = Array.isArray(parsed) ? parsed : [];
         }
@@ -1347,7 +1347,7 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
         weaknesses = [];
       }
     }
-    
+
     // Use stored values from database if available, otherwise calculate fresh
     // Safely access properties that may not exist in DB (defensive coding)
     // Note: These columns (readiness_status, risk_level, etc.) are NOT in the attributes list
@@ -1359,7 +1359,7 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
     const storedRiskExplanation = riskExplanation; // Always use calculated
     const storedCareerDirection = careerDirection; // Always use calculated
     const storedCareerDirectionReason = careerDirectionReason; // Always use calculated
-    
+
     // Safely parse roadmap with defensive checks
     // Handle case where interpretedResult might be null or missing fields
     let storedRoadmap = roadmap;
@@ -1382,12 +1382,12 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
         storedRoadmap = roadmap;
       }
     }
-    
+
     // Parse new fields or generate fallbacks with defensive checks
-    const storedCounsellorSummary = (interpretedResult && interpretedResult.counsellor_summary) 
-      ? interpretedResult.counsellor_summary 
+    const storedCounsellorSummary = (interpretedResult && interpretedResult.counsellor_summary)
+      ? interpretedResult.counsellor_summary
       : '';
-    
+
     let storedReadinessActionGuidance = [];
     if (interpretedResult) {
       try {
@@ -1402,14 +1402,14 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
         storedReadinessActionGuidance = [];
       }
     }
-    
-    const storedCareerConfidenceLevel = (interpretedResult && interpretedResult.career_confidence_level) 
-      ? interpretedResult.career_confidence_level 
+
+    const storedCareerConfidenceLevel = (interpretedResult && interpretedResult.career_confidence_level)
+      ? interpretedResult.career_confidence_level
       : 'MODERATE';
-    const storedCareerConfidenceExplanation = (interpretedResult && interpretedResult.career_confidence_explanation) 
-      ? interpretedResult.career_confidence_explanation 
+    const storedCareerConfidenceExplanation = (interpretedResult && interpretedResult.career_confidence_explanation)
+      ? interpretedResult.career_confidence_explanation
       : '';
-    
+
     let storedDoNowActions = [];
     if (interpretedResult) {
       try {
@@ -1424,7 +1424,7 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
         storedDoNowActions = [];
       }
     }
-    
+
     let storedDoLaterActions = [];
     if (interpretedResult) {
       try {
@@ -1439,9 +1439,9 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
         storedDoLaterActions = [];
       }
     }
-    
-    const storedRiskExplanationHuman = (interpretedResult && interpretedResult.risk_explanation_human) 
-      ? interpretedResult.risk_explanation_human 
+
+    const storedRiskExplanationHuman = (interpretedResult && interpretedResult.risk_explanation_human)
+      ? interpretedResult.risk_explanation_human
       : storedRiskExplanation;
 
     const interpretationData = {
@@ -1458,7 +1458,7 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
         if (!storedRoadmap || typeof storedRoadmap !== 'object') {
           return ['Action plan is being generated. Please refresh in a moment.'];
         }
-        
+
         const actionPlanItems = [];
         try {
           if (storedRoadmap.phase1 && storedRoadmap.phase1.title && Array.isArray(storedRoadmap.phase1.actions)) {
@@ -1476,9 +1476,9 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
         } catch (e) {
           console.warn(`⚠️ Error building action plan for attempt ${testAttemptId}: ${e.message}`);
         }
-        
-        return actionPlanItems.length > 0 
-          ? actionPlanItems 
+
+        return actionPlanItems.length > 0
+          ? actionPlanItems
           : ['Action plan is being generated. Please refresh in a moment.'];
       })(),
       readiness_explanation: storedReadinessExplanation,
@@ -1526,21 +1526,21 @@ router.get('/interpretation/:test_attempt_id', getCurrentUser, requireStudentOrC
   } catch (error) {
     console.error(`❌ Error in get_interpretation: ${error.name}: ${error.message}`);
     console.error(`❌ Error stack: ${error.stack}`);
-    
+
     // Return 400 for validation/data errors, 500 only for unexpected errors
-    if (error.name === 'SequelizeValidationError' || 
-        error.name === 'SequelizeDatabaseError' ||
-        error.message.includes('JSON') ||
-        error.message.includes('parse') ||
-        error.message.includes('null') ||
-        error.message.includes('undefined')) {
+    if (error.name === 'SequelizeValidationError' ||
+      error.name === 'SequelizeDatabaseError' ||
+      error.message.includes('JSON') ||
+      error.message.includes('parse') ||
+      error.message.includes('null') ||
+      error.message.includes('undefined')) {
       return res.status(400).json({
         error_code: 'INTERPRETATION_DATA_ERROR',
         message: 'Invalid interpretation data. Cannot generate interpretation.',
         detail: error.message || 'Data validation failed'
       });
     }
-    
+
     return res.status(500).json({
       error_code: 'INTERNAL_ERROR',
       message: 'An unexpected error occurred while generating interpretation.',
@@ -2063,14 +2063,14 @@ router.get('/sections/:section_id/questions', getCurrentUser, requireStudent, as
     // If questions not assigned yet for this section, generate them now (idempotent - safe to call multiple times)
     if (!selectedQuestionIds || selectedQuestionIds.length === 0) {
       console.log(`⚠️ Test attempt ${attemptId} has no questions assigned for section ${section.id}, generating now...`);
-      
+
       // SQL Query 6: Count eligible questions for this section FIRST (for validation)
       // SELECT COUNT(*) FROM questions WHERE section_id = ? AND status = 'approved' AND is_active = true
       const eligibleQuestionCount = await Question.count({
-        where: { 
+        where: {
           section_id: section.id,
           status: 'approved',
-          is_active: true 
+          is_active: true
         }
       });
 
@@ -2117,7 +2117,7 @@ router.get('/sections/:section_id/questions', getCurrentUser, requireStudent, as
           }],
           attributes: ['question_id']
         });
-        
+
         previousQuestionIds = previousAttemptQuestions.map(tq => tq.question_id);
         console.log(`🔵 Previous attempt had ${previousQuestionIds.length} questions in section ${section.id}`);
       }
@@ -2142,7 +2142,7 @@ router.get('/sections/:section_id/questions', getCurrentUser, requireStudent, as
       const candidateQuestions = await Question.findAll({
         where: candidateWhereClause,
         attributes: ['id'],
-        order: [[sequelize.literal('RAND()'), 'ASC']], // SQL RANDOM selection
+        order: [[sequelize.literal('RANDOM()'), 'ASC']], // SQL RANDOM selection
         limit: 7,
         raw: true
       });
@@ -2157,7 +2157,7 @@ router.get('/sections/:section_id/questions', getCurrentUser, requireStudent, as
             is_active: true
           },
           attributes: ['id'],
-          order: [[sequelize.literal('RAND()'), 'ASC']], // SQL RANDOM selection
+          order: [[sequelize.literal('RANDOM()'), 'ASC']], // SQL RANDOM selection
           limit: 7,
           raw: true
         });
@@ -2166,7 +2166,7 @@ router.get('/sections/:section_id/questions', getCurrentUser, requireStudent, as
         selectedQuestionIds = candidateQuestions.map(q => q.id);
       }
 
-      console.log(`✅ Randomly selected ${selectedQuestionIds.length} questions using SQL RAND() for section ${section.id}: [${selectedQuestionIds.join(', ')}]`);
+      console.log(`✅ Randomly selected ${selectedQuestionIds.length} questions using SQL RANDOM() for section ${section.id}: [${selectedQuestionIds.join(', ')}]`);
 
       // SQL Query 9: Insert selected questions into junction table
       // INSERT INTO test_attempt_questions (test_attempt_id, question_id, created_at) VALUES (?, ?, NOW())
@@ -2227,9 +2227,9 @@ router.post('/sections/:section_id/start', getCurrentUser, requireStudent, async
     // Support both query parameter and body
     const attemptId = parseInt(req.body.attempt_id || req.query.attempt_id, 10);
     const currentUser = req.user;
-    
+
     console.log(`🔵 start_section: sectionId=${sectionId}, attemptId=${attemptId}, userId=${currentUser.id}`);
-    
+
     if (!attemptId || isNaN(attemptId)) {
       return res.status(400).json({
         detail: 'attempt_id is required'
@@ -2263,7 +2263,7 @@ router.post('/sections/:section_id/start', getCurrentUser, requireStudent, async
         detail: `Section not found (ID: ${sectionId})`
       });
     }
-    
+
     console.log(`✅ Found section: id=${section.id}, order_index=${section.order_index}, name=${section.name}`);
 
     // Section start validation based on current_section_id
@@ -2300,7 +2300,7 @@ router.post('/sections/:section_id/start', getCurrentUser, requireStudent, async
           });
 
           const isCompleted = prevProgress && (
-            prevProgress.status === 'COMPLETED' || 
+            prevProgress.status === 'COMPLETED' ||
             prevProgress.status === SectionStatus.COMPLETED
           );
 
@@ -2330,7 +2330,7 @@ router.post('/sections/:section_id/start', getCurrentUser, requireStudent, async
           status: 'IN_PROGRESS', // Use string directly for ENUM
           section_start_time: new Date()
         });
-        
+
         // Update test attempt with current section state
         testAttempt.current_section_id = section.id;
         testAttempt.current_question_index = 0;
@@ -2389,7 +2389,7 @@ router.post('/sections/:section_id/pause', getCurrentUser, requireStudent, async
     // Support both query parameter and body
     const attemptId = parseInt(req.body.attempt_id || req.query.attempt_id, 10);
     const currentUser = req.user;
-    
+
     if (!attemptId || isNaN(attemptId)) {
       return res.status(400).json({
         detail: 'attempt_id is required'
@@ -2439,7 +2439,7 @@ router.post('/sections/:section_id/pause', getCurrentUser, requireStudent, async
     // Calculate remaining time and store it
     const SECTION_TIME_LIMIT = 420;
     let remainingTime = SECTION_TIME_LIMIT;
-    
+
     if (progress.section_start_time && !progress.paused_at) {
       const elapsed = (new Date() - progress.section_start_time) / 1000;
       progress.total_time_spent += Math.floor(elapsed);
@@ -2476,7 +2476,7 @@ router.post('/sections/:section_id/resume', getCurrentUser, requireStudent, asyn
     // Support both query parameter and body
     const attemptId = parseInt(req.body.attempt_id || req.query.attempt_id, 10);
     const currentUser = req.user;
-    
+
     if (!attemptId || isNaN(attemptId)) {
       return res.status(400).json({
         detail: 'attempt_id is required'
@@ -2520,10 +2520,10 @@ router.post('/sections/:section_id/resume', getCurrentUser, requireStudent, asyn
     // Resume timer - continue from remaining_time_seconds stored in test_attempt
     const SECTION_TIME_LIMIT = 420;
     const remainingTime = testAttempt.remaining_time_seconds || (SECTION_TIME_LIMIT - progress.total_time_spent);
-    
+
     // Calculate new total_time_spent based on remaining time
     progress.total_time_spent = Math.max(0, SECTION_TIME_LIMIT - remainingTime);
-    
+
     progress.section_start_time = new Date();
     progress.paused_at = null;
     progress.status = SectionStatus.IN_PROGRESS;
@@ -2678,7 +2678,7 @@ router.post('/sections/:section_id/submit', getCurrentUser, requireStudent, asyn
     });
 
     const selectedQuestionIds = attemptQuestions.map(tq => tq.question_id);
-    
+
     if (!selectedQuestionIds || selectedQuestionIds.length === 0) {
       return res.status(400).json({
         error_code: 'NO_QUESTIONS_ASSIGNED',
@@ -2715,21 +2715,21 @@ router.post('/sections/:section_id/submit', getCurrentUser, requireStudent, asyn
     // If section is already completed, still update current_section_id and return success (idempotent)
     if (progress && (progress.status === SectionStatus.COMPLETED || progress.status === 'COMPLETED')) {
       console.log(`ℹ️ Section ${section.order_index} (${section.name}) already completed, updating current_section_id`);
-      
+
       // Find next section
       const allSections = await Section.findAll({
         where: { is_active: true },
         order: [['order_index', 'ASC']]
       });
       const nextSection = allSections.find(s => s.order_index === section.order_index + 1);
-      
+
       if (nextSection) {
         testAttempt.current_section_id = nextSection.id;
         testAttempt.current_question_index = 0;
         testAttempt.remaining_time_seconds = 420;
         await testAttempt.save();
       }
-      
+
       // Get current section order_index for response
       const currentSectionOrderIndex = nextSection ? nextSection.order_index : null;
 
@@ -2756,7 +2756,7 @@ router.post('/sections/:section_id/submit', getCurrentUser, requireStudent, asyn
     // Still mark section as completed and update current_section_id
     if (allAnswersExist) {
       console.log(`ℹ️ All answers already exist for section ${section.order_index}, marking as completed (idempotent)`);
-      
+
       // Ensure section progress is marked as completed
       if (!progress) {
         progress = await SectionProgress.create({
@@ -2770,14 +2770,14 @@ router.post('/sections/:section_id/submit', getCurrentUser, requireStudent, asyn
         progress.paused_at = null;
         await progress.save();
       }
-      
+
       // Update test attempt with next section
       const allSections = await Section.findAll({
         where: { is_active: true },
         order: [['order_index', 'ASC']]
       });
       const nextSection = allSections.find(s => s.order_index === section.order_index + 1);
-      
+
       if (nextSection) {
         testAttempt.current_section_id = nextSection.id;
         testAttempt.current_question_index = 0;
@@ -2789,7 +2789,7 @@ router.post('/sections/:section_id/submit', getCurrentUser, requireStudent, asyn
         testAttempt.current_section_id = null;
         await testAttempt.save();
       }
-      
+
       return res.json({
         status: 'COMPLETED',
         completed_section: sectionId,
@@ -2845,11 +2845,11 @@ router.post('/sections/:section_id/submit', getCurrentUser, requireStudent, asyn
       progress.status = SectionStatus.COMPLETED; // Use enum constant
       progress.paused_at = null;
       await progress.save();
-      
+
       // Reload to ensure we have the latest data
       await progress.reload();
       console.log(`✅ Section ${section.order_index} (${section.name}) marked as COMPLETED. Status: ${progress.status}, ID: ${progress.id}, Test Attempt: ${attempt_id}`);
-      
+
       // Verify the status was saved correctly
       const verifyProgress = await SectionProgress.findOne({
         where: {
@@ -2866,7 +2866,7 @@ router.post('/sections/:section_id/submit', getCurrentUser, requireStudent, asyn
       order: [['order_index', 'ASC']]
     });
     const nextSection = allSections.find(s => s.order_index === section.order_index + 1);
-    
+
     if (nextSection) {
       testAttempt.current_section_id = nextSection.id;
       testAttempt.current_question_index = 0;
